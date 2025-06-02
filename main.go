@@ -1,10 +1,11 @@
-package main
+﻿package main
 
 import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 
@@ -32,7 +33,7 @@ type Server struct {
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for simplicity
+		return true
 	},
 }
 
@@ -43,9 +44,11 @@ func NewServer() *Server {
 }
 
 func generateRoomID() string {
-	bytes := make([]byte, 4) // 4 bytes for randomness
-	if _, err := rand.Read(bytes); err != nil {
-		panic(err) // This should not happen
+	bytes := make([]byte, 4)
+	_, err := rand.Read(bytes)
+	if err != nil {
+		log.Println("Failed to generate room ID:", err)
+		return "room-error"
 	}
 	return "twl-server-" + hex.EncodeToString(bytes)
 }
@@ -54,14 +57,12 @@ func (s *Server) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	var requestBody struct {
 		Password string `json:"password"`
 	}
-
 	if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-
 	if requestBody.Password == "" {
-		http.Error(w, "Password is required to create a room", http.StatusBadRequest)
+		http.Error(w, "Password is required", http.StatusBadRequest)
 		return
 	}
 
@@ -73,6 +74,7 @@ func (s *Server) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		Clients:  make(map[string]*websocket.Conn),
 		Password: requestBody.Password,
 	}
+
 	w.WriteHeader(http.StatusCreated)
 	fmt.Fprintf(w, "Room created with ID: %s", roomID)
 }
@@ -95,7 +97,6 @@ func (s *Server) JoinRoom(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Room does not exist", http.StatusNotFound)
 		return
 	}
-
 	if room.Password != password {
 		http.Error(w, "Invalid password", http.StatusForbidden)
 		return
@@ -103,53 +104,56 @@ func (s *Server) JoinRoom(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		http.Error(w, "Failed to upgrade connection", http.StatusInternalServerError)
+		http.Error(w, "Failed to upgrade to WebSocket", http.StatusInternalServerError)
 		return
 	}
 
-	// Add the client to the room with their user ID
 	room.Lock.Lock()
 	room.Clients[userID] = conn
 	room.Lock.Unlock()
 
-	// Start listening for messages from this client
+	log.Printf("User %s joined room %s\n", userID, roomID)
+
 	go func() {
 		defer func() {
-			// Clean up when the client disconnects
 			room.Lock.Lock()
 			delete(room.Clients, userID)
 			room.Lock.Unlock()
 			conn.Close()
+			log.Printf("User %s disconnected from room %s\n", userID, roomID)
 		}()
 
-		// Keep the connection open and listen for messages
 		for {
 			_, rawMessage, err := conn.ReadMessage()
 			if err != nil {
-				// If there's an error (e.g., the client disconnects), break the loop
+				log.Printf("Read error from user %s: %v\n", userID, err)
 				break
 			}
 
-			// Parse the incoming message
 			var msg Message
 			if err := json.Unmarshal(rawMessage, &msg); err != nil {
-				fmt.Printf("Invalid message format: %v\n", err)
+				log.Printf("Invalid message from %s: %s\n", userID, string(rawMessage))
 				continue
 			}
 
-			// Process the message based on its type
-			if msg.Type == "alert" {
-				// Broadcast alert messages to all clients in the room
+			log.Printf("Message received in room %s from %s → Type: %s | Content: %s\n", msg.RoomID, msg.UserID, msg.Type, msg.Content)
+
+			switch msg.Type {
+			case "alert":
 				room.Lock.Lock()
-				for _, client := range room.Clients {
-					client.WriteMessage(websocket.TextMessage, rawMessage)
+				for uid, client := range room.Clients {
+					if err := client.WriteMessage(websocket.TextMessage, rawMessage); err != nil {
+						log.Printf("Error sending to %s: %v. Removing client.\n", uid, err)
+						client.Close()
+						delete(room.Clients, uid)
+					}
 				}
 				room.Lock.Unlock()
-			} else if msg.Type == "location" {
-				// Only the server processes location messages (log or handle as needed)
-				fmt.Printf("Location message from %s: %s\n", msg.UserID, msg.Content)
-			} else {
-				fmt.Printf("Unknown message type from %s: %s\n", msg.UserID, msg.Content)
+			case "location":
+				// Only log location updates
+				log.Printf("Location update from %s: %s\n", msg.UserID, msg.Content)
+			default:
+				log.Printf("Unknown message type from %s: %s\n", msg.UserID, msg.Type)
 			}
 		}
 	}()
@@ -167,17 +171,25 @@ func (s *Server) ProduceNotification(w http.ResponseWriter, r *http.Request) {
 	s.Lock.Unlock()
 
 	if !exists {
-		http.Error(w, "Room does not exist", http.StatusNotFound)
+		http.Error(w, "Room not found", http.StatusNotFound)
+		return
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		http.Error(w, "Failed to serialize message", http.StatusInternalServerError)
 		return
 	}
 
 	room.Lock.Lock()
-	defer room.Lock.Unlock()
-	for _, client := range room.Clients {
-		if err := client.WriteMessage(websocket.TextMessage, []byte(msg.Content)); err != nil {
+	for uid, client := range room.Clients {
+		if err := client.WriteMessage(websocket.TextMessage, data); err != nil {
+			log.Printf("Failed to send to %s: %v\n", uid, err)
 			client.Close()
+			delete(room.Clients, uid)
 		}
 	}
+	room.Lock.Unlock()
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "Notification sent")
@@ -186,9 +198,11 @@ func (s *Server) ProduceNotification(w http.ResponseWriter, r *http.Request) {
 func main() {
 	server := NewServer()
 	r := mux.NewRouter()
+
 	r.HandleFunc("/rooms", server.CreateRoom).Methods("POST")
 	r.HandleFunc("/rooms/{room_id}/join", server.JoinRoom).Methods("GET")
 	r.HandleFunc("/produce-notif", server.ProduceNotification).Methods("POST")
 
+	log.Println("Server listening on :8080")
 	http.ListenAndServe(":8080", r)
 }
