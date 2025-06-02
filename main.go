@@ -3,7 +3,6 @@
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,13 +11,6 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 )
-
-type Message struct {
-	RoomID  string `json:"room_id"`
-	UserID  string `json:"user_id"`
-	Type    string `json:"type"`    // "alert" or "location"
-	Content string `json:"content"` // The actual message content
-}
 
 type Room struct {
 	Clients  map[string]*websocket.Conn
@@ -54,14 +46,12 @@ func generateRoomID() string {
 }
 
 func (s *Server) CreateRoom(w http.ResponseWriter, r *http.Request) {
-	var requestBody struct {
+	var password struct {
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-	if requestBody.Password == "" {
+
+	err := json.NewDecoder(r.Body).Decode(&password)
+	if err != nil || password.Password == "" {
 		http.Error(w, "Password is required", http.StatusBadRequest)
 		return
 	}
@@ -72,7 +62,7 @@ func (s *Server) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	roomID := generateRoomID()
 	s.Rooms[roomID] = &Room{
 		Clients:  make(map[string]*websocket.Conn),
-		Password: requestBody.Password,
+		Password: password.Password,
 	}
 
 	w.WriteHeader(http.StatusCreated)
@@ -124,75 +114,32 @@ func (s *Server) JoinRoom(w http.ResponseWriter, r *http.Request) {
 		}()
 
 		for {
-			_, rawMessage, err := conn.ReadMessage()
+			_, message, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("Read error from user %s: %v\n", userID, err)
+				log.Printf("Read error from %s: %v", userID, err)
 				break
 			}
 
-			var msg Message
-			if err := json.Unmarshal(rawMessage, &msg); err != nil {
-				log.Printf("Invalid message from %s: %s\n", userID, string(rawMessage))
-				continue
-			}
+			msgText := string(message)
+			log.Printf("Message from %s in room %s: %s", userID, roomID, msgText)
 
-			log.Printf("Message received in room %s from %s → Type: %s | Content: %s\n", msg.RoomID, msg.UserID, msg.Type, msg.Content)
-
-			switch msg.Type {
-			case "alert":
-				room.Lock.Lock()
-				for uid, client := range room.Clients {
-					if err := client.WriteMessage(websocket.TextMessage, rawMessage); err != nil {
-						log.Printf("Error sending to %s: %v. Removing client.\n", uid, err)
-						client.Close()
-						delete(room.Clients, uid)
-					}
+			// Broadcast to all clients in the room
+			room.Lock.Lock()
+			for uid, client := range room.Clients {
+				if err := client.WriteMessage(websocket.TextMessage, message); err != nil {
+					log.Printf("Send error to %s: %v (removing client)", uid, err)
+					client.Close()
+					delete(room.Clients, uid)
 				}
-				room.Lock.Unlock()
-			case "location":
-				// Only log location updates
-				log.Printf("Location update from %s: %s\n", msg.UserID, msg.Content)
-			default:
-				log.Printf("Unknown message type from %s: %s\n", msg.UserID, msg.Type)
 			}
+			room.Lock.Unlock()
 		}
 	}()
 }
 
+// Optional: Dummy endpoint for backward compatibility, no longer used in plain-text mode
 func (s *Server) ProduceNotification(w http.ResponseWriter, r *http.Request) {
-	var msg Message
-	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	s.Lock.Lock()
-	room, exists := s.Rooms[msg.RoomID]
-	s.Lock.Unlock()
-
-	if !exists {
-		http.Error(w, "Room not found", http.StatusNotFound)
-		return
-	}
-
-	data, err := json.Marshal(msg)
-	if err != nil {
-		http.Error(w, "Failed to serialize message", http.StatusInternalServerError)
-		return
-	}
-
-	room.Lock.Lock()
-	for uid, client := range room.Clients {
-		if err := client.WriteMessage(websocket.TextMessage, data); err != nil {
-			log.Printf("Failed to send to %s: %v\n", uid, err)
-			client.Close()
-			delete(room.Clients, uid)
-		}
-	}
-	room.Lock.Unlock()
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, "Notification sent")
+	http.Error(w, "JSON messaging disabled. Use WebSocket for plain text.", http.StatusBadRequest)
 }
 
 func main() {
