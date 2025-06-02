@@ -66,9 +66,21 @@ func (s *Server) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		Password: password.Password,
 	}
 
-	w.WriteHeader(http.StatusCreated)
-	fmt.Fprintf(w, "Room created with ID: %s", roomID)
+	// Hazır URL ve room bilgilerini JSON olarak dön
+	joinURL := fmt.Sprintf("wss://golang-room-production.up.railway.app/rooms/%s/join?user_id=YOUR_USER_ID&password=%s", roomID, password.Password)
+
+	response := struct {
+		RoomID  string `json:"room_id"`
+		JoinURL string `json:"join_url"`
+	}{
+		RoomID:  roomID,
+		JoinURL: joinURL,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
+
 
 func (s *Server) JoinRoom(w http.ResponseWriter, r *http.Request) {
 	roomID := mux.Vars(r)["room_id"]
