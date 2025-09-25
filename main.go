@@ -1,5 +1,5 @@
 ﻿package main
-
+// test
 import (
 	"crypto/rand"
 	"encoding/hex"
